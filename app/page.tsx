@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 import {
   collection,
-  deleteDoc,
   doc,
   getDocs,
   orderBy,
@@ -11,6 +10,7 @@ import {
   serverTimestamp,
   setDoc,
   updateDoc,
+  writeBatch,
 } from "firebase/firestore";
 import { db, ensureFirebaseUser } from "./firebase";
 
@@ -26,6 +26,7 @@ type R = {
 };
 
 const K = "malmoon";
+const TRASH_K = "malmoon-trash";
 
 const situationOptions = [
   "새 학기, 새 짝을 만났을 때",
@@ -77,6 +78,7 @@ const ratingOptions: { value: Rating; icon: string; label: string }[] = [
 export default function App() {
   const [v, setV] = useState("home");
   const [d, setD] = useState<R[]>([]);
+  const [trash, setTrash] = useState<R[]>([]);
   const [x, setX] = useState<R | null>(null);
   const [f, setF] = useState({ s: "", i: "", g: "" });
   const [selectedInterests, setSelectedInterests] = useState<string[]>([]);
@@ -90,10 +92,13 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     let localRecords: R[] = [];
+    let localTrash: R[] = [];
 
     try {
       localRecords = JSON.parse(localStorage.getItem(K) || "[]");
+      localTrash = JSON.parse(localStorage.getItem(TRASH_K) || "[]");
       setD(localRecords);
+      setTrash(localTrash);
     } catch {
       setE("기록을 불러오지 못했어요.");
     }
@@ -105,13 +110,19 @@ export default function App() {
 
         setFirebaseUid(user.uid);
         const recordsRef = collection(db, "users", user.uid, "records");
-        const snapshot = await getDocs(
-          query(recordsRef, orderBy("createdAt", "desc")),
-        );
-        let cloudRecords = snapshot.docs.map((record) => ({
-          id: record.id,
-          ...(record.data() as Omit<R, "id">),
-        }));
+        const trashRef = collection(db, "users", user.uid, "trash");
+        const [recordsSnapshot, trashSnapshot] = await Promise.all([
+          getDocs(query(recordsRef, orderBy("createdAt", "desc"))),
+          getDocs(query(trashRef, orderBy("deletedAt", "desc"))),
+        ]);
+        const toRecord = (record: (typeof recordsSnapshot.docs)[number]) => {
+          const { createdAt, deletedAt, ...recordData } = record.data();
+          void createdAt;
+          void deletedAt;
+          return { id: record.id, ...(recordData as Omit<R, "id">) };
+        };
+        let cloudRecords = recordsSnapshot.docs.map(toRecord);
+        let cloudTrash = trashSnapshot.docs.map(toRecord);
 
         if (!cloudRecords.length && localRecords.length) {
           await Promise.all(
@@ -126,9 +137,24 @@ export default function App() {
           cloudRecords = localRecords;
         }
 
+        if (!cloudTrash.length && localTrash.length) {
+          await Promise.all(
+            localTrash.map((record) => {
+              const { id, ...recordData } = record;
+              return setDoc(doc(trashRef, id), {
+                ...recordData,
+                deletedAt: serverTimestamp(),
+              });
+            }),
+          );
+          cloudTrash = localTrash;
+        }
+
         if (!cancelled) {
           setD(cloudRecords);
+          setTrash(cloudTrash);
           localStorage.setItem(K, JSON.stringify(cloudRecords));
+          localStorage.setItem(TRASH_K, JSON.stringify(cloudTrash));
           setCloudStatus("connected");
         }
       } catch {
@@ -206,12 +232,21 @@ export default function App() {
   };
 
   const deleteRecord = async (id: string) => {
-    if (!window.confirm("이 기록을 삭제할까요? 삭제한 기록은 복구할 수 없어요."))
+    if (!window.confirm("이 기록을 휴지통으로 이동할까요? 나중에 복원할 수 있어요."))
       return;
 
+    const deletedRecord = d.find((item) => item.id === id);
+    if (!deletedRecord) return;
+
     const next = d.filter((item) => item.id !== id);
+    const nextTrash = [
+      deletedRecord,
+      ...trash.filter((item) => item.id !== id),
+    ];
     localStorage.setItem(K, JSON.stringify(next));
+    localStorage.setItem(TRASH_K, JSON.stringify(nextTrash));
     setD(next);
+    setTrash(nextTrash);
 
     if (!firebaseUid) {
       setCloudStatus("offline");
@@ -220,7 +255,49 @@ export default function App() {
 
     try {
       setCloudStatus("syncing");
-      await deleteDoc(doc(db, "users", firebaseUid, "records", id));
+      const { id: recordId, ...recordData } = deletedRecord;
+      const batch = writeBatch(db);
+      batch.set(doc(db, "users", firebaseUid, "trash", recordId), {
+        ...recordData,
+        deletedAt: serverTimestamp(),
+      });
+      batch.delete(doc(db, "users", firebaseUid, "records", recordId));
+      await batch.commit();
+      setCloudStatus("connected");
+    } catch {
+      setCloudStatus("offline");
+    }
+  };
+
+  const restoreRecord = async (id: string) => {
+    const restoredRecord = trash.find((item) => item.id === id);
+    if (!restoredRecord) return;
+
+    const next = [
+      restoredRecord,
+      ...d.filter((item) => item.id !== restoredRecord.id),
+    ];
+    const nextTrash = trash.filter((item) => item.id !== id);
+    localStorage.setItem(K, JSON.stringify(next));
+    localStorage.setItem(TRASH_K, JSON.stringify(nextTrash));
+    setD(next);
+    setTrash(nextTrash);
+
+    if (!firebaseUid) {
+      setCloudStatus("offline");
+      return;
+    }
+
+    try {
+      setCloudStatus("syncing");
+      const { id: recordId, ...recordData } = restoredRecord;
+      const batch = writeBatch(db);
+      batch.set(doc(db, "users", firebaseUid, "records", recordId), {
+        ...recordData,
+        createdAt: serverTimestamp(),
+      });
+      batch.delete(doc(db, "users", firebaseUid, "trash", recordId));
+      await batch.commit();
       setCloudStatus("connected");
     } catch {
       setCloudStatus("offline");
@@ -612,6 +689,36 @@ export default function App() {
             <div className="state">
               아직 만든 주제가 없어요.
               <button onClick={() => setV("form")}>대화 주제 만들기</button>
+            </div>
+          )}
+          {trash.length > 0 && (
+            <div className="trash-panel">
+              <div className="trash-heading">
+                <div>
+                  <span>휴지통</span>
+                  <h2>최근 삭제한 기록</h2>
+                </div>
+                <b>{trash.length}개</b>
+              </div>
+              <p>잘못 삭제한 기록을 원래 목록으로 되돌릴 수 있어요.</p>
+              <div className="trash-list">
+                {trash.map((item) => (
+                  <article className="trash-item" key={item.id}>
+                    <div>
+                      <strong>{item.s}</strong>
+                      <p>
+                        {item.i} · {item.g}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => restoreRecord(item.id)}
+                    >
+                      ↶ 복원
+                    </button>
+                  </article>
+                ))}
+              </div>
             </div>
           )}
         </section>
