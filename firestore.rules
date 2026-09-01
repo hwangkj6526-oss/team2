@@ -1,0 +1,38 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function isValidRecord() {
+      return request.resource.data.keys().hasOnly([
+        's',
+        'i',
+        'g',
+        't',
+        'rating',
+        'createdAt'
+      ])
+      && request.resource.data.s is string
+      && request.resource.data.s.size() <= 300
+      && request.resource.data.i is string
+      && request.resource.data.i.size() <= 500
+      && request.resource.data.g is string
+      && request.resource.data.g.size() <= 300
+      && request.resource.data.t is list
+      && request.resource.data.t.size() <= 10
+      && request.resource.data.createdAt is timestamp
+      && (
+        !request.resource.data.keys().hasAny(['rating'])
+        || request.resource.data.rating in ['helpful', 'okay', 'notHelpful']
+      );
+    }
+
+    match /users/{userId}/records/{recordId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidRecord();
+    }
+  }
+}
